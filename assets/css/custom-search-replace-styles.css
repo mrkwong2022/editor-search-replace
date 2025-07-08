@@ -1,0 +1,136 @@
+.csr-window {
+    position: fixed;
+    top: 50px; /* Adjust as needed */
+    right: 20px; /* Adjust as needed */
+    width: 350px;
+    background-color: #252526; /* VS Code dark theme color */
+    color: #cccccc;
+    border: 1px solid #333333;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol";
+    font-size: 13px;
+    z-index: 99999;
+    border-radius: 4px;
+    user-select: none;
+}
+
+.csr-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 6px 8px;
+    background-color: #333333;
+    border-bottom: 1px solid #444444;
+}
+
+.csr-mode-indicator-search, .csr-mode-indicator-replace {
+    font-weight: bold;
+}
+
+.csr-actions-right .csr-icon-button {
+    margin-left: 4px;
+}
+
+.csr-body {
+    padding: 8px;
+}
+
+.csr-input-group {
+    display: flex;
+    align-items: center;
+    background-color: #3c3c3c;
+    border-radius: 2px;
+    border: 1px solid #555555;
+    margin-bottom: 8px;
+}
+
+.csr-input-group:focus-within {
+    border-color: #007acc; /* VS Code focus blue */
+}
+
+.csr-input {
+    flex-grow: 1;
+    background-color: transparent;
+    color: #cccccc;
+    border: none;
+    padding: 6px 8px;
+    outline: none;
+    font-size: 13px;
+}
+
+.csr-input::placeholder {
+    color: #888888;
+}
+
+.csr-input-icons {
+    display: flex;
+    align-items: center;
+    padding-right: 4px;
+}
+
+.csr-icon-button {
+    background-color: transparent;
+    color: #cccccc;
+    border: 1px solid transparent;
+    border-radius: 3px;
+    padding: 4px;
+    margin: 0 2px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+.csr-icon-button:hover {
+    background-color: #4f4f4f;
+}
+.csr-icon-button.active {
+    background-color: #007acc;
+    color: white;
+    border-color: #007acc;
+}
+.csr-icon-button svg {
+    display: block; /* Prevents extra space below inline SVGs */
+}
+
+
+.csr-search-controls .csr-navigation-buttons {
+    display: flex;
+    align-items: center;
+    margin-bottom: 8px;
+}
+
+.csr-results-count {
+    margin-right: auto;
+    padding-left: 4px;
+    color: #aaaaaa;
+    font-size: 12px;
+}
+
+
+.csr-replace-controls {
+    /* display: none; by default, managed by JS */
+    border-top: 1px solid #444444;
+    margin-top: 8px;
+    padding-top: 8px;
+}
+
+.csr-action-buttons {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 8px;
+}
+
+.csr-button {
+    background-color: #0e639c;
+    color: white;
+    border: 1px solid #007acc;
+    padding: 5px 10px;
+    border-radius: 2px;
+    cursor: pointer;
+    font-size: 13px;
+    margin-left: 6px;
+}
+
+.csr-button:hover {
+    background-color: #1177bb;
+}
