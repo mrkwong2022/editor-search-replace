@@ -1,4 +1,6 @@
 document.addEventListener('DOMContentLoaded', function () {
+    console.log('CSR: Initializing Custom Search Replace'); // DEBUG
+
     const csrWindow = document.getElementById('csr-window');
     const searchInput = document.getElementById('csr-search-input');
     const closeButton = document.getElementById('csr-close-button');
@@ -29,7 +31,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
     let searchState = {
         searchTerm: '',
-        matches: [], // Array to store match objects {node, startOffset, endOffset, text, element}
+        matches: [], // Array to store match objects {node, startOffset, endOffset, text, element, isTextareaMatch}
         currentIndex: -1,
         options: {
             regex: false,
@@ -39,6 +41,62 @@ document.addEventListener('DOMContentLoaded', function () {
         },
         highlightedSpans: [] // To keep track of created <mark> elements
     };
+    /**
+     * Stores the type of editor content currently being worked with.
+     * Can be 'dom' (for Rich Text editors like TinyMCE visual, Gutenberg visual)
+     * or 'textarea' (for Gutenberg code editor, Classic editor text mode).
+     * Updated by performSearch via getEditorContent.
+     */
+    let currentEditorType = 'dom';
+
+
+    function isGutenbergActive() {
+        // Returns Gutenberg's content-editable element (iframe body or writing flow div) if active
+        // This element is then used as the root for DOM traversal (TreeWalker).
+        const gutenbergIframe = document.querySelector('.block-editor__editor-skeleton iframe[name="editor-canvas"]');
+        if (gutenbergIframe && gutenbergIframe.contentDocument) {
+            if (gutenbergIframe.contentDocument.hasFocus() ||
+                (gutenbergIframe.contentDocument.activeElement && gutenbergIframe.contentDocument.activeElement !== gutenbergIframe.contentDocument.body)) {
+                // console.log("CSR: Gutenberg iframe is considered active"); // DEBUG
+                return gutenbergIframe.contentDocument.body;
+            }
+        }
+
+        const writingFlowSelectors = [
+            '.block-editor-writing-flow', // Common
+            '.editor-styles-wrapper',     // Fallback / Older versions?
+            '.interface-interface-skeleton__content' // Broader container that might hold focus if no specific block is focused
+        ];
+        for (const selector of writingFlowSelectors) {
+            const flowElement = document.querySelector(selector);
+            if (flowElement && (flowElement.contains(document.activeElement) || document.activeElement.closest('.block-editor__editable'))) {
+                // console.log(`CSR: Gutenberg element '${selector}' is considered active`); // DEBUG
+                return flowElement; // Return the most specific editable container or its main wrapper
+            }
+        }
+        return null;
+    }
+
+    function isTinyMCEActive() {
+        // Returns TinyMCE editor body (root for TreeWalker) if active.
+        if (typeof tinymce !== 'undefined' && tinymce.activeEditor && !tinymce.activeEditor.isHidden()) {
+            const editor = tinymce.activeEditor;
+            // Check if the editor itself has focus, or if focus is within its iframe
+            if (editor.hasFocus()) {
+                // console.log("CSR: TinyMCE (editor.hasFocus) is active"); // DEBUG
+                return editor.getBody();
+            }
+            if (editor.iframeElement && editor.iframeElement.contentDocument) {
+                if (editor.iframeElement.contentDocument.hasFocus() ||
+                    (editor.iframeElement.contentDocument.activeElement && editor.iframeElement.contentDocument.activeElement !== editor.iframeElement.contentDocument.body )) {
+                    // console.log("CSR: TinyMCE iframe is active"); // DEBUG
+                    return editor.getBody();
+                }
+            }
+        }
+        return null;
+    }
+
 
     // --- Event Listeners for Search Options ---
     regexButton.addEventListener('click', () => toggleSearchOption('regex', regexButton));
@@ -202,6 +260,312 @@ document.addEventListener('DOMContentLoaded', function () {
         // searchState.highlightedSpans should be empty from clearHighlights
     }
 
+
+    /**
+     * Replaces the content of a single match.
+     * Handles DOM replacement by swapping the <mark> element with a new text node.
+     * Handles textarea replacement by directly manipulating the textarea's value.
+     * @param {object} matchData - The match object.
+     * @param {string} rawReplacementText - The raw text to replace with.
+     * @returns {number|boolean} For textarea: the change in text length (newLength - oldLength).
+     *                             For DOM: true on success, false on failure.
+     *                             Returns false on general failure.
+     */
+    function replaceNodeContent(matchData, rawReplacementText) {
+        if (!matchData || !matchData.node) {
+            // console.warn("CSR: Invalid match data or node for replacement.", matchData);
+            return false;
+        }
+
+        let finalText = rawReplacementText;
+        if (searchState.options.preserveCase) {
+            finalText = applyPreserveCase(matchData.text, rawReplacementText);
+        }
+
+        if (matchData.isTextareaMatch) {
+            const textarea = matchData.node;
+            const originalValue = textarea.value;
+            const originalMatchTextLength = matchData.text.length;
+
+            try {
+                textarea.value = originalValue.substring(0, matchData.startOffset) +
+                                 finalText +
+                                 originalValue.substring(matchData.endOffset);
+
+                matchData.text = finalText;
+                matchData.endOffset = matchData.startOffset + finalText.length; // Update for this specific match
+
+                return finalText.length - originalMatchTextLength; // Return length change
+            } catch (e) {
+                // console.error("CSR: Error replacing content in textarea:", e, matchData);
+                textarea.value = originalValue; // Attempt to restore
+                return false;
+            }
+        } else { // DOM replacement
+            if (!matchData.element || !matchData.element.parentNode) {
+                //  console.warn("CSR: Invalid DOM element for replacement.", matchData);
+                 return false;
+            }
+            const newTextNode = document.createTextNode(finalText);
+            const parent = matchData.element.parentNode;
+            try {
+                parent.replaceChild(newTextNode, matchData.element);
+                parent.normalize();
+                matchData.node = newTextNode;
+                matchData.text = finalText;
+                matchData.element = null; // The <mark> element is gone
+                // TODO: Integrate with WordPress editor's Undo/Redo stack.
+                // Current DOM manipulation is direct and won't be part of TinyMCE or Gutenberg's history.
+                // For TinyMCE: editor.undoManager.transact(() => { /* changes */ });
+                // For Gutenberg: Use wp.data.dispatch('core/block-editor').updateBlockAttributes() or similar.
+                return true;
+            } catch (e) {
+                // console.error("CSR: Error replacing DOM node content:", e, matchData);
+                return false;
+            }
+        }
+    }
+
+    /**
+     * Handles the "Replace" button click. Replaces the current match.
+     * For DOM, it removes the highlight and updates the match list.
+     * For textarea, it adjusts offsets of subsequent matches after replacement.
+     */
+    function replaceOneMatch() {
+        if (searchState.currentIndex === -1 || searchState.matches.length === 0) {
+            updateResultsDisplay();
+            return;
+        }
+
+        const matchToReplace = searchState.matches[searchState.currentIndex];
+        const replacementText = replaceInput.value;
+        // const originalMatchTextLength = matchToReplace.text.length; // Not directly used here anymore
+
+        const replacementResult = replaceNodeContent(matchToReplace, replacementText); // Returns lengthChange for textarea, true/false for DOM
+
+        if (replacementResult !== false) {
+            if (matchToReplace.isTextareaMatch) {
+                const lengthChange = replacementResult; // Cast boolean to number for safety, though it's lengthChange for textarea
+
+                searchState.matches.splice(searchState.currentIndex, 1); // Remove the replaced match
+
+                // Adjust offsets for subsequent matches in the *same textarea*
+                // This is crucial for subsequent "Replace" clicks to target correctly.
+                for (let i = searchState.currentIndex; i < searchState.matches.length; i++) {
+                    if (searchState.matches[i].isTextareaMatch && searchState.matches[i].node === matchToReplace.node) {
+                        searchState.matches[i].startOffset += lengthChange;
+                        searchState.matches[i].endOffset += lengthChange;
+                    }
+                }
+
+                updateResultsDisplay();
+
+                if (searchState.matches.length === 0) {
+                    searchState.currentIndex = -1;
+                    resultsCountDisplay.textContent = csr_i18n.all_matches_replaced || 'All matches replaced.';
+                } else {
+                    // Try to stay at the same index if possible, or move to the new item at that index
+                    if (searchState.currentIndex >= searchState.matches.length) {
+                        searchState.currentIndex = searchState.matches.length - 1;
+                    }
+                    navigateToMatch(searchState.currentIndex);
+                }
+            } else { // DOM match
+                searchState.highlightedSpans = searchState.highlightedSpans.filter(span => span !== matchToReplace.element);
+                searchState.matches.splice(searchState.currentIndex, 1);
+
+                updateResultsDisplay();
+
+                if (searchState.matches.length === 0) {
+                    searchState.currentIndex = -1;
+                    resultsCountDisplay.textContent = csr_i18n.all_matches_replaced || 'All matches replaced.';
+                } else {
+                    if (searchState.currentIndex >= searchState.matches.length) {
+                        searchState.currentIndex = searchState.matches.length - 1;
+                    }
+                    navigateToMatch(searchState.currentIndex);
+                }
+            }
+        } else {
+            resultsCountDisplay.textContent = csr_i18n.error_during_replacement || "Error during replacement.";
+        }
+    }
+
+    function replaceAllMatches() {
+        if (searchState.matches.length === 0) {
+            updateResultsDisplay();
+            return;
+        }
+
+        const replacementText = replaceInput.value;
+        let replacedCount = 0;
+
+        if (currentEditorType === 'textarea' && searchState.matches.length > 0 && searchState.matches[0].isTextareaMatch) {
+            const textarea = searchState.matches[0].node;
+            let currentTextValue = textarea.value;
+            let accumulatedLengthChange = 0; // Keep track of how much the string length has changed
+
+            // Sort matches by startOffset to process them in order for string manipulation
+            // although iterating backwards is generally safer for array mutation, for string replacement
+            // processing from start to end with offset adjustments is also an option.
+            // However, since we are rebuilding the string from parts based on original offsets,
+            // iterating backwards on the original match array is safer to avoid index issues.
+            const matchesToProcess = [...searchState.matches].sort((a,b) => a.startOffset - b.startOffset);
+
+
+            for (let i = matchesToProcess.length - 1; i >= 0; i--) {
+                const matchData = matchesToProcess[i];
+                 if (!matchData.isTextareaMatch || matchData.node !== textarea) continue;
+
+                let finalTextToInsert = replacementText;
+                if (searchState.options.preserveCase) {
+                    finalTextToInsert = applyPreserveCase(matchData.text, replacementText);
+                }
+
+                // Use original offsets from matchData, as currentTextValue is being rebuilt
+                currentTextValue = currentTextValue.substring(0, matchData.startOffset) +
+                                   finalTextToInsert +
+                                   currentTextValue.substring(matchData.endOffset);
+                replacedCount++;
+            }
+            textarea.value = currentTextValue;
+        } else if (currentEditorType === 'dom') {
+            const matchesToProcess = [...searchState.matches]; // Process a copy
+            for (let i = matchesToProcess.length - 1; i >= 0; i--) { // Iterate backwards for DOM
+                if (matchesToProcess[i].isTextareaMatch) continue;
+                if (replaceNodeContent(matchesToProcess[i], replacementText)) {
+                    replacedCount++;
+                }
+            }
+        }
+
+        resultsCountDisplay.textContent = csr_i18n.replaced_n_occurrences ?
+                                          csr_i18n.replaced_n_occurrences.replace('%d', replacedCount) :
+                                          `Replaced ${replacedCount} occurrence(s).`;
+
+        clearHighlights();
+        searchState.matches = [];
+        searchState.currentIndex = -1;
+        // highlightedSpans is cleared in clearHighlights if it's DOM mode
+
+        if (currentEditorType === 'textarea' && searchState.matches.length > 0 && searchState.matches[0].node) {
+           // searchState.matches[0].node.focus(); // searchState.matches is empty now
+        } else if (searchInput) {
+            // searchInput.focus(); // Let user decide next action
+        }
+    }
+
+
+    // --- Textarea Specific Handlers ---
+
+    /**
+     * Placeholder for highlighting all matches in a textarea.
+     * Currently, only the *current* match is "highlighted" by text selection via navigateToTextareaMatch.
+     * General highlighting of all matches with <mark> is not done for textareas.
+     * @param {object} matchData - The match object.
+     */
+    function highlightMatchInTextarea(matchData) {
+        if (!matchData.isTextareaMatch) return;
+        // console.log("CSR: highlightMatchInTextarea: No visual <mark> for textarea. Current match selection is handled by navigateToTextareaMatch.");
+    }
+
+    /**
+     * Placeholder for clearing all highlights in a textarea.
+     * Since <mark> tags are not used, this primarily means ensuring any text selection is cleared if needed.
+     * @param {HTMLTextAreaElement} textareaElement - The textarea element.
+     */
+    function clearTextareaHighlights(textareaElement) {
+        // console.log("CSR: clearTextareaHighlights: No <mark> elements to clear in textarea.");
+        // If a selection was made programmatically for a "current" match, it's typically
+        // superseded by the next navigation or by the user clicking elsewhere.
+        // Explicitly clearing selection:
+        // if (textareaElement && textareaElement === document.activeElement) {
+        //     textareaElement.selectionStart = textareaElement.selectionEnd;
+        // }
+    }
+
+    /**
+     * Navigates to a specific match within a textarea by selecting the text
+     * and scrolling it into view. Updates searchState.currentIndex.
+     * @param {object} matchData - The match object (must be isTextareaMatch: true).
+     * @param {number} index - The index of the match in searchState.matches.
+     */
+    function navigateToTextareaMatch(matchData, index) {
+        if (!matchData || !matchData.isTextareaMatch || !matchData.node || typeof matchData.startOffset !== 'number') {
+            // console.warn("CSR: Invalid data for navigateToTextareaMatch", matchData);
+            return;
+        }
+        const textarea = matchData.node;
+        try {
+            textarea.focus();
+            textarea.selectionStart = matchData.startOffset;
+            textarea.selectionEnd = matchData.endOffset;
+
+            // Scroll into view - native textarea scroll behavior might be sufficient,
+            // but this ensures it if content is long.
+            const textBeforeSelection = textarea.value.substring(0, matchData.startOffset);
+            const lines = textBeforeSelection.split('\n').length;
+            // Rough estimate for line height, might not be perfect.
+            const computedStyle = window.getComputedStyle(textarea);
+            let lineHeight = parseFloat(computedStyle.lineHeight);
+            if (isNaN(lineHeight)) lineHeight = parseFloat(computedStyle.fontSize) * 1.2; // Default multiplier
+
+            textarea.scrollTop = Math.max(0, (lines - Math.floor(textarea.clientHeight / lineHeight / 2)) * lineHeight);
+
+
+            searchState.currentIndex = index; // Crucial: update currentIndex
+            updateResultsDisplay();
+
+        } catch (e) {
+            console.error("CSR: Error navigating in textarea:", e);
+        }
+    }
+
+
+    // --- Search Input Change ---
+    function highlightMatchInTextarea(matchData) {
+        // For textarea, we don't create <mark> elements.
+        // We will "highlight" the current match by selecting it during navigation.
+        // So, this function doesn't need to do anything here for general highlighting of all matches.
+        // Individual current match selection is handled by navigateToMatch.
+        if (!matchData.isTextareaMatch) return; // Should not be called if not textarea
+        // console.log("CSR: highlightMatchInTextarea called, but no visual <mark> for textarea.", matchData);
+    }
+
+    function clearTextareaHighlights(textareaElement) {
+        // No <mark> elements to clear.
+        // If we were storing selection ranges, we might clear them here.
+        // For now, nothing to do.
+        // console.log("CSR: clearTextareaHighlights called.", textareaElement);
+    }
+
+    function navigateToTextareaMatch(matchData, index) {
+        if (!matchData || !matchData.isTextareaMatch || !matchData.node || typeof matchData.startOffset === 'undefined') {
+            console.warn("CSR: Invalid data for navigateToTextareaMatch", matchData);
+            return;
+        }
+        const textarea = matchData.node;
+        try {
+            textarea.focus();
+            textarea.selectionStart = matchData.startOffset;
+            textarea.selectionEnd = matchData.endOffset;
+
+            // Scroll into view - native textarea scroll behavior might be sufficient,
+            // but this ensures it if content is long.
+            const textBeforeSelection = textarea.value.substring(0, matchData.startOffset);
+            const lines = textBeforeSelection.split('\n').length;
+            const avgLineHeight = textarea.scrollHeight / (textarea.value.split('\n').length || 1);
+            textarea.scrollTop = Math.max(0, (lines - 5) * avgLineHeight); // Scroll a bit above the line
+
+            searchState.currentIndex = index;
+            updateResultsDisplay();
+
+        } catch (e) {
+            console.error("CSR: Error navigating in textarea:", e);
+        }
+    }
+
+
     // --- Search Input Change ---
     searchInput.addEventListener('input', function() {
         // Debounce search slightly to avoid performance issues on very fast typing
@@ -236,47 +600,63 @@ document.addEventListener('DOMContentLoaded', function () {
         }
     });
 
+    /**
+     * Performs the search based on the current search term and options.
+     * Determines the editor type, fetches content, finds matches,
+     * and updates the UI with highlights and results.
+     */
     function performSearch() {
         if (!searchState.searchTerm) {
-            clearSearch(); // This will also update display
+            clearSearch();
             return;
         }
 
-        clearHighlights();
+        clearHighlights(); // Considers currentEditorType for proper clearing
         searchState.matches = [];
         searchState.currentIndex = -1;
-        searchState.highlightedSpans = [];
+        if (currentEditorType === 'dom') {
+            searchState.highlightedSpans = []; // Reset spans only for DOM mode
+        }
 
+        const editorData = getEditorContent(); // Fetches content and determines type ('dom' or 'textarea')
+        currentEditorType = editorData.type;   // Update global state for editor type
 
-        const editorContent = getEditorContent();
-        if (!editorContent.nodes || editorContent.nodes.length === 0) {
-            updateResultsDisplay();
+        // Validate editorData based on its type before proceeding
+        if (currentEditorType === 'textarea' && typeof editorData.text !== 'string') {
+            updateResultsDisplay(true, csr_i18n.no_results || 'No results');
+            console.warn("CSR: Textarea mode but no text provided.", editorData);
             return;
+        }
+        if (currentEditorType === 'dom' && (!editorData.nodes || editorData.nodes.length === 0)) {
+            // It's possible to have a DOM editor with no text nodes yet (e.g. empty post)
+            // updateResultsDisplay will handle showing "No results" if search term is present.
+            // So, only log if sourceElement itself is missing, which would be an error in getEditorContent
+            if (!editorData.sourceElement) console.warn("CSR: DOM mode but no sourceElement or text nodes.", editorData);
         }
 
         const rawMatches = findMatchesInContent(editorContent.nodes, searchState.searchTerm, searchState.options);
 
-        // Highlight and store valid matches
-        rawMatches.forEach(matchData => {
-            const markElement = highlightMatchInNode(matchData.node, matchData.startOffset, matchData.endOffset);
-            if (markElement) {
-                matchData.element = markElement; // Store the actual <mark> element
-                searchState.matches.push(matchData); // Add to confirmed matches
-                searchState.highlightedSpans.push(markElement);
+        if (currentEditorType === 'dom') {
+            rawMatches.forEach(matchData => {
+                if (matchData.isTextareaMatch) return; // Should not happen if findMatchesInContent is correct
+                const markElement = highlightMatchInNode(matchData.node, matchData.startOffset, matchData.endOffset);
+                if (markElement) {
+                    matchData.element = markElement;
+                    searchState.matches.push(matchData);
+                    searchState.highlightedSpans.push(markElement);
+                }
+            });
+            if (searchState.matches.length > 1) {
+                searchState.matches.sort((a, b) => {
+                    if (!a.element || !b.element) return 0;
+                    const pos = a.element.compareDocumentPosition(b.element);
+                    if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+                    if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+                    return 0;
+                }).reverse();
             }
-        });
-
-        // Sort matches by their document order to ensure consistent navigation
-        // This is crucial because node traversal might not always yield elements in perfect document order,
-        // especially if editor content is complex or modified during the process.
-        if (searchState.matches.length > 1) {
-            searchState.matches.sort((a, b) => {
-                if (!a.element || !b.element) return 0; // Should not happen if markElement was successful
-                const pos = a.element.compareDocumentPosition(b.element);
-                if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1; // a is before b
-                if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;  // a is after b
-                return 0;
-            }).reverse(); // .reverse() because FOLLOWING means it comes after, PRECEDING means before. We want top-to-bottom.
+        } else { // textarea
+            searchState.matches = rawMatches; // rawMatches are already suitable for textarea
         }
 
         updateResultsDisplay();
@@ -284,39 +664,65 @@ document.addEventListener('DOMContentLoaded', function () {
         if (searchState.matches.length > 0) {
             navigateToMatch(0);
         } else {
-             searchInput.focus(); // Keep focus if no matches
+             // Focus appropriate input if no matches
+             if (editorData.sourceElement && currentEditorType === 'textarea') editorData.sourceElement.focus();
+             else if (searchInput) searchInput.focus();
         }
     }
 
+    /**
+     * Clears the current search results and highlights.
+     * Keeps the search term in the input field.
+     */
     function clearSearch() {
-        clearHighlights();
+        clearHighlights(); // This function now considers currentEditorType
         searchState.matches = [];
         searchState.currentIndex = -1;
-        // searchState.searchTerm remains in the input
-        updateResultsDisplay();
+        updateResultsDisplay(); // Update to show "No results" or empty if term is also empty
     }
 
+    /**
+     * Clears all visual highlights from the editor.
+     * For DOM mode, it removes <mark> tags and .csr-current-match class.
+     * For textarea mode, it conceptually does nothing as highlights are transient selections.
+     */
     function clearHighlights() {
-        // Remove 'current match' styling from any previous match
-        if (searchState.currentIndex !== -1 &&
-            searchState.matches[searchState.currentIndex] &&
-            searchState.matches[searchState.currentIndex].element) {
-            searchState.matches[searchState.currentIndex].element.classList.remove('csr-current-match');
-        }
-
-        searchState.highlightedSpans.forEach(span => {
-            if (span && span.parentNode) {
-                const textNode = document.createTextNode(span.textContent);
-                try {
-                    span.parentNode.replaceChild(textNode, span);
-                    textNode.parentNode.normalize();
-                } catch (e) {
-                    console.warn("CSR: Error un-highlighting node:", e, span);
-                }
+        if (currentEditorType === 'dom') {
+            // Remove 'current match' styling from the currently active DOM match element
+            if (searchState.currentIndex !== -1 &&
+                searchState.matches.length > searchState.currentIndex &&
+                searchState.matches[searchState.currentIndex] &&
+                !searchState.matches[searchState.currentIndex].isTextareaMatch &&
+                searchState.matches[searchState.currentIndex].element) {
+                searchState.matches[searchState.currentIndex].element.classList.remove('csr-current-match');
             }
-        });
-        searchState.highlightedSpans = [];
+
+            // Unwrap all <mark> tags used for highlighting
+            searchState.highlightedSpans.forEach(span => {
+                if (span && span.parentNode) {
+                    const textNode = document.createTextNode(span.textContent);
+                    try {
+                        span.parentNode.replaceChild(textNode, span);
+                        textNode.parentNode.normalize();
+                    } catch (e) {
+                        // console.warn("CSR: Error un-highlighting node:", e, span);
+                    }
+                }
+            });
+            searchState.highlightedSpans = [];
+        } else { // textarea
+            // For textarea, "clearing highlights" means deselecting text.
+            // This is implicitly handled when a new search starts or window closes.
+            // Or if a specific textarea element was stored as "currently highlighted"
+            // const currentTextareaMatch = searchState.matches[searchState.currentIndex];
+            // if (currentTextareaMatch && currentTextareaMatch.isTextareaMatch && currentTextareaMatch.node) {
+            //    currentTextareaMatch.node.selectionStart = currentTextareaMatch.node.selectionEnd;
+            // }
+            // console.log("CSR: Cleared highlights for textarea (conceptually).");
+        }
     }
+
+    // highlightMatchInNode remains for DOM, no changes needed here for textarea logic itself
 
     function highlightMatchInNode(textNode, startOffset, endOffset) {
         if (!textNode || textNode.nodeType !== Node.TEXT_NODE || startOffset < 0 || endOffset < 0 || endOffset <= startOffset) {
@@ -533,8 +939,59 @@ document.addEventListener('DOMContentLoaded', function () {
             currentMatchElement.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
         }
 
-        // searchInput.focus(); // Re-focusing can be jarring if user is trying to see the match
+        // searchInput.focus();
         updateResultsDisplay();
+    }
+
+    /**
+     * Navigates to a specific match by its index in the searchState.matches array.
+     * Handles navigation differently for DOM matches (scrolls to <mark> element)
+     * and textarea matches (selects text and scrolls textarea).
+     * @param {number} index - The index of the match to navigate to.
+     */
+    function navigateToMatch(index) {
+        if (searchState.matches.length === 0 || index < 0 || index >= searchState.matches.length) {
+             // If current index was valid, attempt to remove its 'current-match' class (for DOM)
+             if (searchState.currentIndex !== -1 &&
+                 searchState.matches.length > searchState.currentIndex && // Check if old currentIndex is still in bounds (it might not be if matches were cleared)
+                 currentEditorType === 'dom' &&
+                 searchState.matches[searchState.currentIndex] &&
+                 searchState.matches[searchState.currentIndex].element) {
+                 searchState.matches[searchState.currentIndex].element.classList.remove('csr-current-match');
+             }
+             searchState.currentIndex = -1;
+             updateResultsDisplay();
+             return;
+        }
+        const matchData = searchState.matches[index];
+
+        if (matchData.isTextareaMatch) {
+            navigateToTextareaMatch(matchData, index); // This function handles its own currentIndex and display update.
+        } else { // DOM match
+            if (!matchData || !matchData.element) {
+                // console.warn("CSR: Attempted to navigate to invalid DOM match data or element", index, matchData);
+                return;
+            }
+
+            // Remove .csr-current-match from the previously current DOM element
+            if (searchState.currentIndex !== -1 &&
+                searchState.matches[searchState.currentIndex] &&
+                !searchState.matches[searchState.currentIndex].isTextareaMatch && // Ensure it was a DOM match
+                searchState.matches[searchState.currentIndex].element) {
+                searchState.matches[searchState.currentIndex].element.classList.remove('csr-current-match');
+            }
+
+            searchState.currentIndex = index;
+            const currentMatchElement = matchData.element;
+            currentMatchElement.classList.add('csr-current-match');
+
+            if (typeof currentMatchElement.scrollIntoViewIfNeeded === 'function') {
+                currentMatchElement.scrollIntoViewIfNeeded(false);
+            } else {
+                currentMatchElement.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
+            }
+            updateResultsDisplay();
+        }
     }
 
     function navigateToNextMatch() {
@@ -721,6 +1178,314 @@ document.addEventListener('DOMContentLoaded', function () {
     if (replaceInput.placeholder !== (csr_i18n.replace_placeholder || 'Replace')) {
         replaceInput.placeholder = csr_i18n.replace_placeholder || 'Replace';
     }
+
+    // Function to handle the keydown event
+    function handleKeyDown(e) {
+        // console.log('CSR: Keydown event detected on:', e.currentTarget.constructor.name, e.key, e.ctrlKey, e.metaKey, e.target); // Detailed DEBUG
+        if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') { // toLowerCase for 'f'
+            console.log('CSR: Ctrl+F / Cmd+F detected.'); // DEBUG
+            e.preventDefault();
+            e.stopPropagation();
+            if (window.getComputedStyle(csrWindow).display === 'none') {
+                openSearchWindow();
+            } else {
+                searchInput.focus();
+                searchInput.select();
+            }
+            return;
+        }
+
+        if (e.key === 'Escape' && window.getComputedStyle(csrWindow).display !== 'none') {
+            console.log('CSR: Escape key detected, closing window.'); // DEBUG
+            e.preventDefault();
+            e.stopPropagation();
+            closeSearchWindow();
+            return;
+        }
+    }
+
+    // Attach keydown listener to the main document
+    document.addEventListener('keydown', handleKeyDown);
+    console.log('CSR: Attached keydown listener to main document.'); // DEBUG
+
+    // Function to try and attach listener to editor iframes
+    function attachToEditorIFrames() {
+        console.log('CSR: Attempting to attach listeners to iframes.'); // DEBUG
+        // For Classic Editor (TinyMCE)
+        const tinyMCEIframe = document.getElementById('content_ifr');
+        if (tinyMCEIframe) {
+            if (tinyMCEIframe.contentDocument) {
+                try {
+                    tinyMCEIframe.contentDocument.removeEventListener('keydown', handleKeyDown); // Remove if already attached
+                    tinyMCEIframe.contentDocument.addEventListener('keydown', handleKeyDown);
+                    console.log('CSR: Attached keydown listener to TinyMCE iframe.'); // DEBUG
+                } catch (err) {
+                    console.warn('CSR: Error attaching keydown listener to TinyMCE iframe:', err);
+                }
+            } else {
+                 console.log('CSR: TinyMCE iframe found, but contentDocument not accessible yet.'); // DEBUG
+            }
+        } else {
+            // console.log('CSR: TinyMCE iframe (#content_ifr) not found.'); // DEBUG
+        }
+
+        // For Gutenberg iframe mode (if applicable)
+        const gutenbergCanvasIframe = document.querySelector('.block-editor__editor-skeleton iframe[name="editor-canvas"]');
+        if (gutenbergCanvasIframe) {
+            if (gutenbergCanvasIframe.contentDocument) {
+                try {
+                    gutenbergCanvasIframe.contentDocument.removeEventListener('keydown', handleKeyDown); // Remove if already attached
+                    gutenbergCanvasIframe.contentDocument.addEventListener('keydown', handleKeyDown);
+                    console.log('CSR: Attached keydown listener to Gutenberg canvas iframe.'); // DEBUG
+                } catch (err) {
+                    console.warn('CSR: Error attaching keydown listener to Gutenberg canvas iframe:', err);
+                }
+            } else {
+                console.log('CSR: Gutenberg canvas iframe found, but contentDocument not accessible yet.'); // DEBUG
+            }
+        } else {
+            // console.log('CSR: Gutenberg canvas iframe not found.'); // DEBUG
+        }
+    }
+
+    // Initial attempt and then retry mechanism
+    attachToEditorIFrames(); // Initial try
+
+    // Fallback for iframes loading later
+    // Using 'load' on window might be too late for iframes already in DOM but not fully initialized.
+    // A MutationObserver on the body for iframe additions could be more robust but is more complex.
+    // setInterval is not ideal, but as a fallback for retrying:
+    let attachAttempts = 0;
+    const attachInterval = setInterval(() => {
+        attachToEditorIFrames(); // This function now logs internally if it attaches or not
+        attachAttempts++;
+        if (attachAttempts >= 5) {
+            clearInterval(attachInterval);
+            // console.log('CSR: Stopped interval for attaching to iframes.'); // DEBUG
+        }
+    }, 1000);
+
+    /**
+     * Determines the active editor and retrieves its content.
+     * Prioritizes Gutenberg Code Editor, then active visual editors (Gutenberg/TinyMCE),
+     * then falls back to checking common textarea/DOM structures.
+     * @returns {object} An object containing:
+     *  - `nodes`: Array of text nodes (for 'dom' type) or empty array (for 'textarea').
+     *  - `sourceElement`: The main DOM element of the editor (e.g., textarea or visual editor's root).
+     *  - `type`: String, either 'dom' or 'textarea'.
+     *  - `text`: String, the full text content (primarily for 'textarea' type).
+     */
+    function getEditorContent() {
+        let activeEditorElement = null;
+        const textNodes = [];
+        let contentType = 'dom';
+        let rawTextContent = '';
+
+        // console.log("CSR: getEditorContent called"); // DEBUG
+
+        // 1. Check for Gutenberg Code Editor (Text Mode) / HTML Editor
+        // This mode uses a textarea for direct HTML/text input.
+        const gutenbergTextEditorTextarea = document.querySelector('textarea.block-editor-plain-text, textarea.editor-post-text-editor__body');
+        if (gutenbergTextEditorTextarea &&
+            (gutenbergTextEditorTextarea.offsetParent !== null || gutenbergTextEditorTextarea.closest('.is-active'))) { // Check visibility/activity
+            // console.log("CSR: Gutenberg Text Editor (Code Mode) detected.", gutenbergTextEditorTextarea); // DEBUG
+            activeEditorElement = gutenbergTextEditorTextarea;
+            contentType = 'textarea';
+            rawTextContent = gutenbergTextEditorTextarea.value;
+            return { nodes: [], sourceElement: activeEditorElement, type: contentType, text: rawTextContent };
+        }
+
+        // 2. Check for active visual editors (Gutenberg Visual or TinyMCE)
+        let visualEditorRoot = isGutenbergActive(); // Returns DOM element or null
+        if (visualEditorRoot) {
+            // console.log("CSR: Gutenberg Visual Editor detected as active.", visualEditorRoot); // DEBUG
+            activeEditorElement = visualEditorRoot;
+            contentType = 'dom';
+        } else {
+            visualEditorRoot = isTinyMCEActive(); // Returns DOM element or null
+            if (visualEditorRoot) {
+                // console.log("CSR: TinyMCE Visual Editor detected as active.", visualEditorRoot); // DEBUG
+                activeEditorElement = visualEditorRoot;
+                contentType = 'dom';
+            }
+        }
+
+        // 3. Fallback if no specific active editor was clearly identified by the above
+        if (!activeEditorElement) {
+            // console.log("CSR: No specific active editor, attempting fallback scan."); // DEBUG
+            // Try to find a generic content area, could be either a textarea or a rich text area
+            const classicTextarea = document.getElementById('content'); // Classic editor textarea (if TinyMCE not initialized or in text mode)
+            const gutenbergMainArea = document.querySelector('.editor-styles-wrapper'); // Common Gutenberg wrapper
+            const tinyMceIframeBody = document.getElementById('content_ifr')?.contentDocument?.body;
+
+            if (classicTextarea && classicTextarea.offsetParent !== null && classicTextarea.tagName === 'TEXTAREA' && !tinyMceIframeBody) {
+                 // Check if classic editor is in Text mode (TinyMCE iframe would not exist or be hidden)
+                const classicEditorTextModeActive = document.body.classList.contains('html-editor'); // WordPress adds this class
+                if (classicEditorTextModeActive || (document.getElementById('wp-content-wrap') && document.getElementById('wp-content-wrap').classList.contains('html-editor'))) {
+                    // console.log("CSR: Classic Editor in Text Mode detected (fallback).", classicTextarea); // DEBUG
+                    activeEditorElement = classicTextarea;
+                    contentType = 'textarea';
+                    rawTextContent = classicTextarea.value;
+                    return { nodes: [], sourceElement: activeEditorElement, type: contentType, text: rawTextContent };
+                }
+            }
+
+            // If not a textarea, assume DOM-based editor from fallbacks
+            activeEditorElement = tinyMceIframeBody || gutenbergMainArea || classicTextarea /* if it wasn't textarea mode */;
+            if (activeEditorElement) contentType = 'dom'; // Assume dom if element found but not textarea
+            // console.log("CSR: Fallback editor element found:", activeEditorElement); // DEBUG
+        }
+
+        if (activeEditorElement && contentType === 'dom') {
+            // console.log("CSR: Processing active DOM editor element:", activeEditorElement); // DEBUG
+            const treeWalkerAcceptNode = {
+                acceptNode: function (node) {
+                    if (node.parentElement.closest('#csr-window') ||
+                        node.parentElement.tagName === 'SCRIPT' ||
+                        node.parentElement.tagName === 'STYLE' ||
+                        node.parentElement.classList.contains('csr-highlight')) {
+                        return NodeFilter.FILTER_REJECT;
+                    }
+                    let currentElement = node.parentElement;
+                    let isVisible = true;
+                    const ownerDoc = activeEditorElement.ownerDocument || activeEditorElement; // Handle iframe body
+                    while(currentElement && currentElement !== ownerDoc.body && currentElement !== activeEditorElement) {
+                        if (window.getComputedStyle(currentElement).display === 'none' || window.getComputedStyle(currentElement).visibility === 'hidden') {
+                            isVisible = false;
+                            break;
+                        }
+                        currentElement = currentElement.parentElement;
+                    }
+                    if (!isVisible) return NodeFilter.FILTER_REJECT;
+                    if (node.nodeValue.trim() === '') return NodeFilter.FILTER_REJECT;
+                    return NodeFilter.FILTER_ACCEPT;
+                }
+            };
+
+            const treeWalkerInstance = (activeEditorElement.ownerDocument || document).createTreeWalker(
+                activeEditorElement,
+                NodeFilter.SHOW_TEXT,
+                treeWalkerAcceptNode,
+                false
+            );
+            let node;
+            while (node = treeWalkerInstance.nextNode()) {
+                textNodes.push(node);
+            }
+            // if(textNodes.length === 0 && activeEditorElement.innerText && activeEditorElement.innerText.trim() !== '') console.log("CSR: TreeWalker found 0 text nodes, but element has innerText."); // DEBUG
+        } else if (!activeEditorElement) {
+            // console.warn("CSR: No active editor element could be determined for content retrieval."); // DEBUG
+        }
+
+        return { nodes: textNodes, sourceElement: activeEditorElement, type: contentType, text: rawTextContent };
+    }
+
+    /**
+     * Finds all occurrences of a search term in the provided editor content.
+     * Handles both DOM node arrays (from visual editors) and plain text (from textareas).
+     * @param {object} editorData - The object returned by getEditorContent().
+     * @param {string} term - The search term.
+     * @param {object} options - Search options (regex, caseSensitive, wholeWord).
+     * @returns {Array<object>} An array of match objects. Each object contains:
+     *  - `node`: The text node (for DOM) or the textarea element.
+     *  - `startOffset`: Start index of the match within the node's text or textarea's value.
+     *  - `endOffset`: End index of the match.
+     *  - `text`: The matched text itself.
+     *  - `isTextareaMatch`: Boolean, true if the match is from a textarea.
+     *  - `element`: (For DOM matches only, after highlighting) The <mark> element used for highlighting.
+     */
+    function findMatchesInContent(editorData, term, options) {
+        const foundMatches = [];
+        // Validate editorData: must have (nodes array for DOM) or (text string for textarea)
+        if (!term ||
+            !editorData ||
+            (editorData.type === 'dom' && (!editorData.nodes || !Array.isArray(editorData.nodes))) ||
+            (editorData.type === 'textarea' && typeof editorData.text !== 'string')) {
+            updateResultsDisplay(true, csr_i18n.no_results || 'No results');
+            return foundMatches;
+        }
+
+        const flags = options.caseSensitive ? 'g' : 'gi';
+        let searchRegex;
+
+        if (options.regex) {
+            try {
+                if (!term.trim()) {
+                     updateResultsDisplay(true, csr_i18n.no_results || 'No results');
+                     return foundMatches;
+                }
+                searchRegex = new RegExp(term, flags);
+            } catch (e) {
+                updateResultsDisplay(true, csr_i18n.invalid_regex || 'Invalid Regex');
+                return foundMatches;
+            }
+        } else {
+            const escapedTerm = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            if (!escapedTerm.trim()) {
+                 updateResultsDisplay(true, csr_i18n.no_results || 'No results');
+                 return foundMatches;
+            }
+            if (options.wholeWord) {
+                searchRegex = new RegExp(`\\b${escapedTerm}\\b`, flags);
+            } else {
+                searchRegex = new RegExp(escapedTerm, flags);
+            }
+        }
+
+        if (editorData.type === 'textarea') {
+            // console.log("CSR: Searching in textarea content"); // DEBUG
+            const textContent = editorData.text;
+            let match;
+            if (searchRegex.global) searchRegex.lastIndex = 0;
+            while ((match = searchRegex.exec(textContent)) !== null) {
+                if (match[0].length === 0) {
+                    if (searchRegex.lastIndex >= textContent.length && searchRegex.global) break;
+                    if (searchRegex.global) searchRegex.lastIndex++;
+                    else break; // Prevent infinite loop for non-global zero-length match
+                    continue;
+                }
+                foundMatches.push({
+                    node: editorData.sourceElement,
+                    startOffset: match.index,
+                    endOffset: match.index + match[0].length,
+                    text: match[0],
+                    isTextareaMatch: true
+                });
+                if (!searchRegex.global) break;
+            }
+        } else if (editorData.nodes && editorData.nodes.length > 0) {
+            // console.log("CSR: Searching in DOM nodes", editorData.nodes.length); // DEBUG
+            editorData.nodes.forEach(textNode => {
+                let match;
+                const nodeText = textNode.nodeValue;
+                if (searchRegex.global) searchRegex.lastIndex = 0;
+                while ((match = searchRegex.exec(nodeText)) !== null) {
+                    if (match[0].length === 0) {
+                        if (searchRegex.lastIndex >= nodeText.length && searchRegex.global) break;
+                        if (searchRegex.global) searchRegex.lastIndex++;
+                        else break;
+                        continue;
+                    }
+                    foundMatches.push({
+                        node: textNode,
+                        startOffset: match.index,
+                        endOffset: match.index + match[0].length,
+                        text: match[0],
+                        isTextareaMatch: false
+                    });
+                    if (!searchRegex.global) break;
+                }
+            });
+        } else {
+            // console.log("CSR: No nodes to search in DOM mode, or unknown type. Editor Source:", editorData.sourceElement); // DEBUG
+        }
+
+        if(foundMatches.length === 0) {
+            updateResultsDisplay(true, searchState.searchTerm.trim() ? (csr_i18n.no_results || 'No results') : '');
+        }
+        return foundMatches;
+    }
+
 
     // Update dynamic text using csr_i18n
     // Example: updateResultsDisplay function needs to use csr_i18n strings.
