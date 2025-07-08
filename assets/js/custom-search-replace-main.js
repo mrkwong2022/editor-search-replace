@@ -48,6 +48,8 @@ document.addEventListener('DOMContentLoaded', function () {
      * Updated by performSearch via getEditorContent.
      */
     let currentEditorType = 'dom';
+    let isCsrWindowOpen = false;
+    let lastActiveElement = null;
 
 
     function isGutenbergActive() {
@@ -724,47 +726,91 @@ document.addEventListener('DOMContentLoaded', function () {
 
     // highlightMatchInNode remains for DOM, no changes needed here for textarea logic itself
 
-    function highlightMatchInNode(textNode, startOffset, endOffset) {
-        if (!textNode || textNode.nodeType !== Node.TEXT_NODE || startOffset < 0 || endOffset < 0 || endOffset <= startOffset) {
-            return null;
-        }
-
-        const originalText = textNode.nodeValue;
-        if (startOffset >= originalText.length || endOffset > originalText.length) {
-             console.warn("CSR: Invalid offsets for highlighting.", textNode, startOffset, endOffset, originalText.length);
-             return null;
-        }
-
-        const matchText = originalText.substring(startOffset, endOffset);
-        if (!matchText) return null;
-
-        try {
-            const mark = document.createElement('mark');
-            mark.className = 'csr-highlight';
-            mark.textContent = matchText;
-
-            // Split the text node: before, match, after
-            let middleBit = textNode.splitText(startOffset); // textNode is now 'before'
-            let afterBit = middleBit.splitText(matchText.length); // middleBit is now 'match', afterBit is 'after'
-
-            const parent = textNode.parentNode; // Or middleBit.parentNode before it's replaced
-            if (parent) {
-                parent.replaceChild(mark, middleBit); // Replace the 'match' text part with the <mark>
-                return mark;
-            }
-        } catch (e) {
-            console.error("CSR: Error highlighting node:", e, {tn: textNode.nodeValue, so:startOffset, eo:endOffset});
-            // If splitText fails, or parent is null. Try to restore original node if possible.
-            // This part is tricky; ideally, the conditions at the start prevent most errors.
-            if (textNode && textNode.nodeValue !== originalText) { // If splitText partially succeeded
-                 // Attempt to merge them back if they are siblings. This is a simplification.
-                 // A more robust solution would involve a full DOM state rollback or more careful splitting.
-                 if (textNode.parentNode) textNode.parentNode.normalize();
-            }
-            return null;
-        }
+function highlightMatchInNode(textNode, startOffset, endOffset) {
+    if (!textNode || textNode.nodeType !== Node.TEXT_NODE || startOffset < 0 || endOffset < 0 || endOffset <= startOffset) {
+        // console.warn("CSR: highlightMatchInNode - Invalid input", textNode, startOffset, endOffset); // DEBUG
         return null;
     }
+
+    const originalText = textNode.nodeValue;
+    // Ensure offsets are within the bounds of the original text.
+    // startOffset can be 0, endOffset can be originalText.length.
+    if (startOffset > originalText.length || endOffset > originalText.length || startOffset > endOffset) {
+         // console.warn("CSR: highlightMatchInNode - Invalid offsets for highlighting.", { nodeValue: originalText, startOffset, endOffset, originalLength: originalText.length }); // DEBUG
+         return null;
+    }
+
+    const matchText = originalText.substring(startOffset, endOffset);
+    if (!matchText) { // If substring is empty, no need to highlight.
+        // console.warn("CSR: highlightMatchInNode - Extracted matchText is empty."); // DEBUG
+        return null;
+    }
+
+    // console.log(`CSR: highlightMatchInNode - Attempting to highlight "${matchText}" in node:`, textNode.parentNode); // DEBUG
+    // console.log(`CSR: --- Node value: "${originalText}" (len: ${originalText.length}), start: ${startOffset}, end: ${endOffset}`); // DEBUG
+
+    try {
+        const mark = document.createElement('mark');
+        mark.className = 'csr-highlight';
+        mark.textContent = matchText;
+
+        let S = textNode; // S is the part before the match
+        let M;            // M will be the part that matches
+        let E;            // E will be the part after the match
+
+        if (startOffset === 0 && endOffset === S.length) { // Match is the entire text node
+            M = S;
+            S = null; // No preceding text
+            E = null; // No succeeding text
+        } else if (startOffset === 0) { // Match starts at the beginning of the node
+            M = S.splitText(endOffset); // S becomes the match, M becomes the rest (E)
+            E = M;
+            M = S;
+            S = null;
+        } else if (endOffset === S.length) { // Match ends at the end of the node
+            M = S.splitText(startOffset); // S is before, M is the match
+            E = null;
+        } else { // Match is in the middle
+            M = S.splitText(startOffset); // S is before, M is match + end
+            E = M.splitText(matchText.length); // M is match, E is end
+        }
+
+        // console.log(`CSR: --- Split parts: S="${S ? S.nodeValue : 'null'}", M="${M ? M.nodeValue : 'null'}", E="${E ? E.nodeValue : 'null'}"`); // DEBUG
+
+        if (!M || M.nodeValue !== matchText) {
+            // console.warn(`CSR: highlightMatchInNode - Mismatch or M is null! Expected M to be "${matchText}", got "${M ? M.nodeValue : 'null'}". This indicates an issue with splitText or logic.`);
+            // Attempt to put things back if they were split and S still exists with a parent
+            if (S && S.parentNode) S.parentNode.normalize();
+            else if (textNode && textNode.parentNode) textNode.parentNode.normalize(); // Fallback to original node
+            return null;
+        }
+
+        const parent = M.parentNode;
+        if (parent) {
+            parent.replaceChild(mark, M);
+            // console.log("CSR: --- Replaced M with mark. Parent:", parent); // DEBUG
+            // No normalize() here to avoid messing with subsequent matches in sibling text nodes from the same original node.
+            // Normalization should happen after all operations on a broader scope if needed.
+            return mark;
+        } else {
+            // console.warn("CSR: highlightMatchInNode - Parent node not found for M. Node M:", M); // DEBUG
+            // If S still exists and has a parent, try to normalize it to clean up splits
+            if (S && S.parentNode) S.parentNode.normalize();
+            else if (textNode && textNode.parentNode) textNode.parentNode.normalize();
+            return null;
+        }
+    } catch (e) {
+        console.error("CSR: highlightMatchInNode - Error during DOM manipulation:", e, {
+            originalNodeValue: originalText,
+            matchText: matchText,
+            startOffset: startOffset,
+            endOffset: endOffset,
+            textNodeState: textNode ? textNode.nodeValue : 'null'
+        });
+        if (textNode && textNode.parentNode) textNode.parentNode.normalize();
+        return null;
+    }
+}
 
     function getEditorContent() {
         let activeEditorElement = null;
@@ -1396,40 +1442,50 @@ document.addEventListener('DOMContentLoaded', function () {
      */
     function findMatchesInContent(editorData, term, options) {
         const foundMatches = [];
-        // Validate editorData: must have (nodes array for DOM) or (text string for textarea)
-        if (!term ||
+        if (!term.trim() || // Exit early if term is empty or only whitespace
             !editorData ||
             (editorData.type === 'dom' && (!editorData.nodes || !Array.isArray(editorData.nodes))) ||
             (editorData.type === 'textarea' && typeof editorData.text !== 'string')) {
-            updateResultsDisplay(true, csr_i18n.no_results || 'No results');
+
+            if (term.trim()) { // Only show "No results" if there was a non-empty search term
+                updateResultsDisplay(true, csr_i18n.no_results || 'No results');
+            } else {
+                updateResultsDisplay(true, ""); // Clear display if search term was empty
+            }
             return foundMatches;
         }
 
         const flags = options.caseSensitive ? 'g' : 'gi';
         let searchRegex;
+        let searchTermForRegex = term;
+
+        // console.log(`CSR: findMatchesInContent - Term: "${term}", RegexOpt: ${options.regex}, CaseOpt: ${options.caseSensitive}, WholeOpt: ${options.wholeWord}`); // DEBUG
 
         if (options.regex) {
+            if (!searchTermForRegex.trim()) {
+                 updateResultsDisplay(true, ""); // Clear if regex term is effectively empty
+                 return foundMatches;
+            }
             try {
-                if (!term.trim()) {
-                     updateResultsDisplay(true, csr_i18n.no_results || 'No results');
-                     return foundMatches;
-                }
-                searchRegex = new RegExp(term, flags);
+                searchRegex = new RegExp(searchTermForRegex, flags);
+                // console.log("CSR: Created Regex:", searchRegex); // DEBUG
             } catch (e) {
+                // console.error("CSR: Invalid Regular Expression:", e); // DEBUG
                 updateResultsDisplay(true, csr_i18n.invalid_regex || 'Invalid Regex');
                 return foundMatches;
             }
         } else {
-            const escapedTerm = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            if (!escapedTerm.trim()) {
-                 updateResultsDisplay(true, csr_i18n.no_results || 'No results');
+            searchTermForRegex = searchTermForRegex.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            if (!searchTermForRegex.trim()) {
+                 updateResultsDisplay(true, ""); // Clear if escaped term is effectively empty
                  return foundMatches;
             }
             if (options.wholeWord) {
-                searchRegex = new RegExp(`\\b${escapedTerm}\\b`, flags);
+                searchRegex = new RegExp(`\\b${searchTermForRegex}\\b`, flags);
             } else {
-                searchRegex = new RegExp(escapedTerm, flags);
+                searchRegex = new RegExp(searchTermForRegex, flags);
             }
+            // console.log("CSR: Created Literal Regex:", searchRegex); // DEBUG
         }
 
         if (editorData.type === 'textarea') {
@@ -1480,9 +1536,13 @@ document.addEventListener('DOMContentLoaded', function () {
             // console.log("CSR: No nodes to search in DOM mode, or unknown type. Editor Source:", editorData.sourceElement); // DEBUG
         }
 
-        if(foundMatches.length === 0) {
-            updateResultsDisplay(true, searchState.searchTerm.trim() ? (csr_i18n.no_results || 'No results') : '');
+        // Update display based on whether matches were found AND if there was a search term
+        if (foundMatches.length === 0 && term.trim() !== "") {
+            updateResultsDisplay(true, (csr_i18n.no_results || 'No results'));
+        } else if (term.trim() === "" && foundMatches.length === 0) { // Term was empty or became empty
+             updateResultsDisplay(true, ""); // Clear display, no "No results" needed
         }
+        // If matches are found, updateResultsDisplay will be called by performSearch after sorting.
         return foundMatches;
     }
 
